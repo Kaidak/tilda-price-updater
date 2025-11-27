@@ -7,18 +7,14 @@ import io
 def load_file(uploaded_file):
     """
     Умная загрузка: понимает и CSV, и Excel.
-    Возвращает DataFrame.
     """
     if uploaded_file.name.endswith('.xlsx'):
-        # Читаем Excel
         try:
-            # dtype=str гарантирует, что артикулы "00123" не превратятся в числа 123
             return pd.read_excel(uploaded_file, dtype=str)
         except Exception as e:
             st.error(f"Ошибка при чтении Excel: {e}")
             return None
     else:
-        # Читаем CSV (с перебором кодировок)
         try:
             return pd.read_csv(uploaded_file, sep=';', encoding='utf-8', dtype=str)
         except UnicodeDecodeError:
@@ -41,16 +37,15 @@ def clean_price(price_str):
 def make_beautiful_price(price):
     """
     Делает цену красивой (оканчивает на 9).
-    Пример: 1542 -> 1549.
     """
     if pd.isna(price):
         return price
-    # Логика: отбрасываем копейки и единицы (делочисленное деление на 10),
-    # умножаем обратно на 10 и прибавляем 9.
     return int(price // 10) * 10 + 9
 
-def process_files(file_tilda, file_new_prices, percent_change, 
-                  col_sku_tilda, col_price_tilda, col_sku_new, col_price_new,
+def process_files(file_tilda, file_new_prices, 
+                  percent_main, percent_old, update_old_flag,
+                  col_sku_tilda, col_price_tilda, col_old_price_tilda,
+                  col_sku_new, col_price_new,
                   do_beautiful_prices):
     
     # 1. Загружаем файлы
@@ -61,70 +56,114 @@ def process_files(file_tilda, file_new_prices, percent_change,
         return None, None, "Ошибка чтения файлов."
 
     # 2. Проверка колонок
-    if col_sku_tilda not in df_tilda.columns or col_price_tilda not in df_tilda.columns:
-        return None, None, f"Ошибка: В файле Тильды нет колонок '{col_sku_tilda}' или '{col_price_tilda}'"
+    required_tilda = [col_sku_tilda, col_price_tilda]
+    if update_old_flag:
+        required_tilda.append(col_old_price_tilda)
+
+    # Проверяем наличие колонок в Тильде
+    for col in required_tilda:
+        if col not in df_tilda.columns:
+             # Если колонки "Old Price" нет, но мы хотим её обновить, создадим её пустой
+            if col == col_old_price_tilda and update_old_flag:
+                df_tilda[col_old_price_tilda] = ""
+            else:
+                return None, None, f"Ошибка: В файле Тильды нет колонки '{col}'"
     
     if col_sku_new not in df_new.columns or col_price_new not in df_new.columns:
         return None, None, f"Ошибка: В новом прайсе нет колонок '{col_sku_new}' или '{col_price_new}'"
 
-    # 3. Подготовка данных (чистим пробелы в артикулах)
+    # 3. Подготовка данных
     df_tilda[col_sku_tilda] = df_tilda[col_sku_tilda].str.strip()
     df_new[col_sku_new] = df_new[col_sku_new].str.strip()
     
-    # 4. Расчет цен
-    df_new['clean_price'] = df_new[col_price_new].apply(clean_price)
+    # Очищаем базовую цену из прайса
+    df_new['clean_price_base'] = df_new[col_price_new].apply(clean_price)
     
-    # Применяем процент
-    multiplier = 1 + (percent_change / 100)
-    df_new['calculated_price'] = df_new['clean_price'] * multiplier
+    # --- РАСЧЕТ ОСНОВНОЙ ЦЕНЫ ---
+    mult_main = 1 + (percent_main / 100)
+    df_new['calc_main'] = df_new['clean_price_base'] * mult_main
     
-    # Применяем "Красивые цены" или просто округляем
+    # --- РАСЧЕТ СТАРОЙ ЦЕНЫ (если нужно) ---
+    if update_old_flag:
+        mult_old = 1 + (percent_old / 100)
+        df_new['calc_old'] = df_new['clean_price_base'] * mult_old
+    
+    # --- ОКРУГЛЕНИЕ / КРАСИВЫЕ ЦЕНЫ ---
     if do_beautiful_prices:
-        df_new['final_price'] = df_new['calculated_price'].apply(make_beautiful_price)
+        df_new['final_main'] = df_new['calc_main'].apply(make_beautiful_price)
+        if update_old_flag:
+            df_new['final_old'] = df_new['calc_old'].apply(make_beautiful_price)
     else:
-        df_new['final_price'] = df_new['calculated_price'].round(2)
+        df_new['final_main'] = df_new['calc_main'].round(2)
+        if update_old_flag:
+            df_new['final_old'] = df_new['calc_old'].round(2)
 
-    # Создаем справочник цен
-    # dropna убирает товары без цены
-    valid_prices = df_new.dropna(subset=['final_price'])
-    price_map = valid_prices.set_index(col_sku_new)['final_price'].to_dict()
+    # Создаем справочники (Артикул -> Цена)
+    # dropna() нужен, чтобы не обновлять товары, где цена не распозналась
+    main_price_map = df_new.dropna(subset=['final_main']).set_index(col_sku_new)['final_main'].to_dict()
+    
+    old_price_map = {}
+    if update_old_flag:
+        old_price_map = df_new.dropna(subset=['final_old']).set_index(col_sku_new)['final_old'].to_dict()
 
     # 5. Обновление каталога Тильды
     count_updated = 0
-    def update_row(row):
+    
+    # Мы используем цикл iterrows или apply, но чтобы обновить 2 колонки сразу,
+    # проще сделать функцию, которая возвращает Series, или пройтись дважды.
+    # Сделаем через apply, возвращая обновленную строку.
+    
+    def update_row_logic(row):
         sku = row[col_sku_tilda]
-        if sku in price_map:
-            nonlocal count_updated
+        updated = False
+        
+        # Обновляем основную цену
+        if sku in main_price_map:
+            row[col_price_tilda] = main_price_map[sku]
+            updated = True
+            
+        # Обновляем старую цену (только если нашли артикул)
+        if update_old_flag and sku in old_price_map:
+            row[col_old_price_tilda] = old_price_map[sku]
+            
+        return row, updated
+
+    # Применяем логику. 
+    # Внимание: apply с axis=1 и изменением row внутри работает, но чтобы посчитать count_updated,
+    # сделаем чуть хитрее.
+    
+    updated_rows_indices = []
+    
+    # Проходим по индексу, чтобы изменять конкретные ячейки (это быстрее и надежнее)
+    for idx in df_tilda.index:
+        sku = df_tilda.at[idx, col_sku_tilda]
+        
+        # Обновление Main Price
+        if sku in main_price_map:
+            df_tilda.at[idx, col_price_tilda] = main_price_map[sku]
+            
+            # Обновление Old Price (если включено)
+            if update_old_flag and sku in old_price_map:
+                df_tilda.at[idx, col_old_price_tilda] = old_price_map[sku]
+            
             count_updated += 1
-            return price_map[sku]
-        else:
-            return row[col_price_tilda]
 
-    df_tilda[col_price_tilda] = df_tilda.apply(update_row, axis=1)
-
-    # 6. Поиск НЕНАЙДЕННЫХ товаров (Пункт №3)
-    # Берем все артикулы из Тильды в множество (set) для быстрого поиска
+    # 6. Отчет о новых товарах
     tilda_skus = set(df_tilda[col_sku_tilda])
+    missing_items_df = df_new[~df_new[col_sku_new].isin(tilda_skus)].copy()
     
-    # Фильтруем новый прайс: оставляем только те, чьих артикулов НЕТ в Тильде
-    missing_items_df = valid_prices[~valid_prices[col_sku_new].isin(tilda_skus)].copy()
-    
-    # Оставляем в отчете только полезные колонки
-    cols_to_keep = [col_sku_new, col_price_new, 'final_price']
-    # Если есть еще название товара, можно добавить, но мы не знаем его имя колонки точно.
-    # Поэтому оставим все колонки нового файла, это безопаснее.
-    
-    missing_count = len(missing_items_df)
-
-    message = f"✅ Готово! Обновлено товаров: {count_updated}. Новых товаров (нет на сайте): {missing_count}."
-    
-    return df_tilda, missing_items_df, message
+    # Собираем сообщение
+    msg_parts = [f"✅ Обновлено товаров: {count_updated}."]
+    if update_old_flag:
+        msg_parts.append(f" (Включая колонку '{col_old_price_tilda}').")
+        
+    return df_tilda, missing_items_df, " ".join(msg_parts)
 
 # --- ИНТЕРФЕЙС ---
-st.set_page_config(page_title="Tilda Price Master", page_icon="🛒")
+st.set_page_config(page_title="Tilda Price Master 4.0", page_icon="🏷️")
 
-st.title('Обновление цен для Tilda v3.0 🚀')
-st.markdown("Поддерживает CSV и Excel (.xlsx). Умеет делать красивые цены и находить новые товары.")
+st.title('Tilda Price Master 4.0 🏷️')
+st.markdown("Обновление **Цены** и **Старой цены** (для скидок). Поддержка Excel и CSV.")
 
 # Загрузка
 col1, col2 = st.columns(2)
@@ -142,6 +181,7 @@ with st.expander("⚙️ Настройки названий колонок", ex
         st.markdown("**Файл Тильды**")
         u_sku_tilda = st.text_input("Колонка Артикула", value="SKU")
         u_price_tilda = st.text_input("Колонка Цены", value="Price")
+        u_old_price_tilda = st.text_input("Колонка 'Старой цены'", value="Old Price")
     with c_set2:
         st.markdown("**Новый прайс**")
         u_sku_new = st.text_input("Колонка Артикула (new)", value="Артикул")
@@ -149,60 +189,72 @@ with st.expander("⚙️ Настройки названий колонок", ex
 
 st.divider()
 
-# Настройки цен
-st.subheader("Правила обработки")
+# --- НАСТРОЙКИ ЦЕН (ОСНОВНОЙ БЛОК) ---
+st.subheader("Настройки наценки")
 
-col_p1, col_p2 = st.columns(2)
+# Колонка 1: Основная цена
+c_price1, c_price2 = st.columns(2)
 
-with col_p1:
-    percent = st.number_input(
-        "Изменение цены (%)", 
-        min_value=-99.0, max_value=1000.0, value=0.0, step=1.0
+with c_price1:
+    st.markdown("#### 🔵 Основная цена")
+    percent_main = st.number_input(
+        "Наценка для 'Price' (%)", 
+        min_value=-99.0, max_value=1000.0, value=0.0, step=1.0, key="p_main"
     )
-    if percent > 0:
-        st.caption(f"Цена 1000 -> {1000 * (1 + percent/100)}")
+    st.caption("Цена продажи на сайте.")
 
-with col_p2:
-    st.write("") # Отступ
-    st.write("") 
-    # Галочка "Красивые цены"
-    use_beautiful = st.checkbox("🔥 Сделать цены красивыми (окончание на 9)", value=False)
-    if use_beautiful:
-        st.caption("Пример: 1543 -> 1549")
+with c_price2:
+    st.markdown("#### 🔴 Старая цена (зачеркнутая)")
+    update_old = st.checkbox("Обновлять колонку 'Old Price'", value=False)
+    
+    if update_old:
+        percent_old = st.number_input(
+            "Наценка для 'Old Price' (%)", 
+            min_value=-99.0, max_value=1000.0, value=20.0, step=1.0, key="p_old"
+        )
+        st.caption("Эта цена будет выше и зачеркнута.")
+    else:
+        percent_old = 0.0
+
+st.divider()
+st.write("#### 🎨 Оформление")
+use_beautiful = st.checkbox("🔥 Сделать цены красивыми (окончание на 9)", value=False)
+if use_beautiful:
+    st.caption("Применится и к обычной, и к старой цене. Пример: 1542 -> 1549")
 
 st.divider()
 
 # Кнопка запуска
 if uploaded_tilda and uploaded_new:
     if st.button('🚀 Рассчитать и Обновить', type="primary"):
-        with st.spinner('Анализирую файлы...'):
+        with st.spinner('Считаем скидки...'):
             
-            # Запускаем обработку
             result_df, missing_df, msg = process_files(
-                uploaded_tilda, uploaded_new, percent,
-                u_sku_tilda, u_price_tilda, u_sku_new, u_price_new,
+                uploaded_tilda, uploaded_new, 
+                percent_main, percent_old, update_old,
+                u_sku_tilda, u_price_tilda, u_old_price_tilda,
+                u_sku_new, u_price_new,
                 use_beautiful
             )
             
             if result_df is not None:
                 st.success(msg)
                 
-                # Кнопка 1: Скачать обновленный каталог
+                # Кнопка скачивания результата
                 csv_buffer = result_df.to_csv(sep=';', index=False, encoding='utf-8-sig').encode('utf-8-sig')
                 st.download_button(
                     label="📥 Скачать обновленный КАТАЛОГ",
                     data=csv_buffer,
-                    file_name="tilda_updated_full.csv",
+                    file_name="tilda_updated_sales.csv",
                     mime="text/csv"
                 )
                 
-                # Кнопка 2: Скачать недостающие товары (если есть)
+                # Кнопка скачивания новинок
                 if missing_df is not None and not missing_df.empty:
-                    st.warning(f"⚠️ Найдено {len(missing_df)} товаров, которых нет в каталоге Тильды.")
-                    
+                    st.warning(f"⚠️ Найдено {len(missing_df)} новых товаров.")
                     csv_missing = missing_df.to_csv(sep=';', index=False, encoding='utf-8-sig').encode('utf-8-sig')
                     st.download_button(
-                        label="📄 Скачать список НОВЫХ товаров",
+                        label="📄 Скачать список НОВИНОК",
                         data=csv_missing,
                         file_name="missing_items.csv",
                         mime="text/csv"
